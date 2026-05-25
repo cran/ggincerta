@@ -1,159 +1,125 @@
-#' @rdname ggsfgl
-#' @export
-StatGlyph <- ggproto(
-  "StatGlyph",
-  StatSf,
-  required_aes = c("v1", "v2", "geometry"),
-  compute_panel = function(data, scales, coord, size, style, max_v2) {
-    data <- StatSf$compute_panel(data, scales, coord)
-    data <- sf::st_as_sf(data)
-    centroids <- sf::st_centroid(data$geometry)
-    coords <- sf::st_coordinates(centroids)
-    data$long <- coords[, 1]
-    data$lat <- coords[, 2]
+parse_glyph_mapping <- function(mapping) {
+  mapping <- mapping %||% aes()
 
-    errs <- data$v2
-    max_err <- if (is.null(max_v2))
-      max(errs, na.rm = TRUE)
-    else
-      max_v2
-    data$theta <- -(errs / max_err) * pi
-    data$id <- seq_len(nrow(data))
-    data$size <- size
-    data$style <- style
+  list(
+    mapping = mapping,
+    has_angle = !is.null(mapping$angle),
+    has_smile = !is.null(mapping$smile)
+  )
+}
 
-    polys <- lapply(seq_len(nrow(data)), function(i) {
-      shape_i <- data$style[i]
-      if (!shape_i %in% c("icone", "semi"))
-        stop("Glyph name not recognised. Must be one of icone or semi.")
-      if (shape_i == "icone") {
-        x1 <- seq(-3, 3, .05)
-        y1 <- sqrt(9 - x1^2)
-        cir <- data.frame(x = x1, y = y1)
-        x2 <- c(-3, 0, 3)
-        y2 <- c(0, -5, 0)
-        tri <- data.frame(x = x2, y = y2)
-        glyphDat <- rbind(cir, tri)
-      } else {
-        x1 <- seq(-3, 3, .05)
-        y1 <- sqrt(9 - x1^2)
-        glyphDat <- data.frame(x = x1, y = y1)
-      }
-
-      theta <- data$theta[i]
-      R <- matrix(c(cos(theta), sin(theta), -sin(theta), cos(theta)), 2)
-      Nmat <- R %*% t(glyphDat / data$size[i])
-      N <- as.data.frame(t(Nmat))
-
-      data.frame(
-        fill = rep(data$v1[i], nrow(glyphDat)),
-        glyph = rep(data$v2[i], nrow(glyphDat)),
-        group = rep(data$id[i], nrow(glyphDat)),
-        x = N$V1 + data$long[i],
-        y = N$V2 + data$lat[i],
-        stringsAsFactors = FALSE
-      )
-    })
-    do.call(rbind, polys)
-  }
-)
-
-GeomPolygonGlyph <- ggproto(
-  "GeomPolygonGlyph",
-  GeomPolygon,
-  default_aes = c(GeomPolygon$default_aes, aes(glyph = NA))
-)
-
-#' Generate glyph maps on sf objects
+#' Glyph map
 #'
-#' `geom_sf_glyph()` adds a glyph map layer based on simple feature (sf) objects
-#' to a ggplot. A glyph map is essentially a centroid-based map, where each
-#' region is represented by a rotated glyph, and the rotation angle indicates
-#' the value of `v2` specified in the mapping.
+#' `geom_sf_glyph()` generates a glyph map sf layer. A glyph map is a
+#' centroid-based map, where each region is represented by a chosen glyph.
 #'
-#' @section Glyph map layer contents:
-#' The layer returned by `geom_sf_glyph()` actually contains two scales,
-#' corresponding to the two variables specified in the mapping.
-#' Therefore, modifying the scale for `v1` will trigger a warning
-#' indicating that the scale for `fill` is being replaced.
+#' Regular shape glyphs can be treated as ordinary point-like symbols and used
+#' together with `bivariate_scale()`. Drop-shaped glyphs use rotation angle to
+#' represent uncertainty. Chernoff glyphs are adapted from the `ggChernoff`
+#' package and work with the `smile` aesthetic.
 #'
 #' @inheritParams ggplot2::geom_sf
-#' @param mapping Set of aesthetic mappings created by [ggplot2::aes()].
-#'   `v1` and `v2` are required, which are the variables used for glyph fill
-#'   and rotation, respectively.
+#' @param shape Glyph shape. One of `"circle"` (the default), `"square"`,
+#'   `"triangle"`, `"hex"`, `"drop"`, or `"chernoff"`.
+#' @param max_angle Maximum value of the `angle` aesthetic used for rescaling
+#'   glyph rotation.
 #' @param size A positive numeric scaling factor controlling glyph size.
-#'   Larger values produce smaller glyphs.
-#' @param style Either `"icone"` or `"semi"`. Controls the glyph shape.
-#' @param max_v2 Numeric value setting the upper limit for `v2`.
-#'
+#' @param point_fun Function used to calculate the representative point for each
+#'   region. The default is usually [sf::st_point_on_surface()].
+#' @param border_colour Colour used for glyph borders.
+#' @param angle_guide Logical indicating whether to display a guide for the
+#'   `angle` aesthetic.
+#' @param angle_name Title used for the angle guide.
+#' @param angle_order Order of the angle guide relative to other guides.
 #' @returns A list of ggplot2 layer objects.
-#'
 #' @examples
-#' # Basic glyph map
-#' p <- ggplot(nc) + geom_sf_glyph(mapping = aes(v1 = value, v2 = sd))
-#' p1 <- ggplot(nc) + geom_sf_glyph(mapping = aes(v1 = value, v2 = sd), style = "semi")
+#' # Regular glyph map
+#' ggplot(nc) +
+#'   geom_sf_glyph(aes(colour = value), shape = "hex")
 #'
-#' # Customize labels and theme
-#' p + labs(title = "glyph map on nc") + theme(legend.position = "left", legend.box = "horizontal")
+#' # Rotated drop glyph map
+#' ggplot(nc) +
+#'   geom_sf_glyph(
+#'     aes(colour = value, angle = sd),
+#'     shape = "drop"
+#'   )
 #'
-#' # Replacing the internal fill scale triggers a message
-#' # ("Scale for fill is already present. Adding another scale for fill...")
-#' p + scale_fill_distiller(palette = "Blues")
-#'
-#' @rdname ggsfgl
+#' # Chernoff face glyph map
+#' if (requireNamespace("ggChernoff", quietly = TRUE)) {
+#'   ggplot(nc) +
+#'     geom_sf_glyph(
+#'       aes(colour = value, smile = sd),
+#'       shape = "chernoff"
+#'     )
+#' }
 #' @export
 geom_sf_glyph <- function(mapping = NULL,
                           data = NULL,
-                          size = 70,
-                          style = "icone",
-                          max_v2 = NULL,
-                          position = "identity",
-                          show.legend = TRUE,
+                          ...,
+                          shape = "circle",
+                          max_angle = NULL,
+                          size = 1,
+                          point_fun = sf::st_point_on_surface,
+                          border_colour = NA,
+                          na.rm = FALSE,
+                          show.legend = NA,
                           inherit.aes = TRUE,
-                          ...) {
+                          angle_guide = TRUE,
+                          angle_name = waiver(),
+                          angle_order = 99) {
+  parsed <- parse_glyph_mapping(mapping)
+  mapping <- parsed$mapping
 
-
-  needs_geometry <- is.null(rlang::get_expr(mapping$geometry))
-  if (needs_geometry) {
-    geom_col <- NULL
-    if (!is.null(data) && inherits(data, "sf")) {
-      geom_col <- attr(data, "sf_column")
-    } else {
-      geom_col <- "geometry"
-    }
-    mapping$geometry <- rlang::sym(geom_col)
+  if (parsed$has_angle && shape != "drop") {
+    cli::cli_warn("{.aes angle} is only used when {.code shape = 'drop'}.")
+    mapping$angle <- NULL
   }
 
-  v1_title <- rlang::as_label(mapping$v1)
-  v2_title <- rlang::as_label(mapping$v2)
+  if (parsed$has_smile && shape != "chernoff") {
+    cli::cli_warn("{.aes smile} is only used when {.code shape = 'chernoff'}.")
+    mapping$smile <- NULL
+  }
 
-  c(
-    layer(
-      stat = StatGlyph,
-      data = data,
-      mapping = mapping,
-      geom = GeomPolygonGlyph,
-      position = position,
-      show.legend = show.legend,
-      inherit.aes = inherit.aes,
-      params = list(
-        size = size,
-        style = style,
-        max_v2 = max_v2,
-        ...
-      )
-    ),
-    coord_sf(),
-    scale_fill_distiller(
-      name = v1_title,
-      palette = "Oranges",
-      direction = 1,
-      guide = guide_colorbar(order = 1)
-    ),
-    scale_glyph_continuous(
-      name = v2_title,
-      order = 2,
-      style = style
-    )
+  if (shape == "chernoff") {
+    return(list(
+      geom_sf_chernoff(
+        mapping = mapping,
+        data = data,
+        ...,
+        fun.geometry = point_fun,
+        na.rm = na.rm,
+        show.legend = show.legend,
+        inherit.aes = inherit.aes
+      ),
+      scale_smile_continuous()
+    ))
+  }
+
+  layer <- geom_sf_pin(
+    mapping = mapping,
+    data = data,
+    ...,
+    shape = shape,
+    max_angle = max_angle,
+    size = size,
+    point_fun = point_fun,
+    border_colour = border_colour,
+    na.rm = na.rm,
+    show.legend = show.legend,
+    inherit.aes = inherit.aes
   )
+
+  if (!parsed$has_angle ||
+      shape != "drop" || !isTRUE(angle_guide)) {
+    return(layer)
+  }
+
+  angle_label <- if (is_waiver(angle_name)) {
+    rlang::as_label(mapping$angle)
+  } else {
+    angle_name
+  }
+
+  list(layer,
+       scale_angle_continuous(name = angle_label, order = angle_order))
 }
