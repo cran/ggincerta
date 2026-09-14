@@ -7,36 +7,73 @@ ScaleBivariate <- ggproto(
   drop = FALSE,
   na.value = NA,
 
+  is_discrete_1d = function(self, i) {
+    isTRUE(self$.discrete[i])
+  },
+
   transform = function(self, x) {
     if (!inherits(x, "bivariate")) {
       return(x)
     }
 
+    x1 <- do.call(c, lapply(x, `[[`, "v1"))
+    x2 <- do.call(c, lapply(x, `[[`, "v2"))
+    vars <- attr(x, "vars")
+
+    discrete <- c(is.factor(x1), is.factor(x2))
+
     trans1 <- scales::as.transform(self$transforms[[1]])
     trans2 <- scales::as.transform(self$transforms[[2]])
 
-    x1 <- vapply(x, `[[`, numeric(1), "v1")
-    x2 <- vapply(x, `[[`, numeric(1), "v2")
-    vars <- attr(x, "vars")
+    x1_t <- if (discrete[1]) {
+      x1
+    } else {
+      trans1$transform(x1)
+    }
 
-    x1_t <- trans1$transform(x1)
-    x2_t <- trans2$transform(x2)
+    x2_t <- if (discrete[2]) {
+      x2
+    } else {
+      trans2$transform(x2)
+    }
 
     self$.trained_values_raw <- list(x1, x2)
     self$.trained_values_transformed <- list(x1_t, x2_t)
+    self$.discrete <- discrete
+
+    self$.levels <- list(if (discrete[1]) {
+      levels(x1)
+    } else {
+      NULL
+    }, if (discrete[2]) {
+      levels(x2)
+    } else {
+      NULL
+    })
+
     self$var_names <- vars
 
     structure(
-      Map(function(a, b)
-        list(v1 = a, v2 = b), x1_t, x2_t),
+      Map(function(a, b) {
+        list(v1 = a, v2 = b)
+      }, x1_t, x2_t),
       class = c("bivariate", "list"),
       vars = vars
     )
   },
 
   get_limits_1d = function(self, i) {
-    br <- self$breaks[[i]]
     lim <- self$limits[[i]]
+
+    if (self$is_discrete_1d(i)) {
+      if (!is.null(lim)) {
+        return(as.character(lim))
+      }
+
+      return(self$.levels[[i]])
+    }
+
+    br <- self$breaks[[i]]
 
     if (!is.null(lim)) {
       return(sort(as.numeric(lim)))
@@ -45,6 +82,7 @@ ScaleBivariate <- ggproto(
     if (is.numeric(br)) {
       br <- sort(unique(as.numeric(br)))
       br <- br[is.finite(br)]
+
       return(range(br))
     }
 
@@ -63,6 +101,10 @@ ScaleBivariate <- ggproto(
   },
 
   get_breaks_1d = function(self, i, limits = self$get_limits()[[i]]) {
+    if (self$is_discrete_1d(i)) {
+      return(limits)
+    }
+
     numeric_breaks <- function(x) {
       x <- sort(unique(as.numeric(x)))
       x[is.finite(x)]
@@ -70,53 +112,81 @@ ScaleBivariate <- ggproto(
 
     br <- self$breaks[[i]]
 
+    # User-supplied numeric breaks
     if (is.numeric(br)) {
       br <- numeric_breaks(br)
 
       if (!is.null(limits)) {
-        br <- br[br >= limits[1] & br <= limits[2]]
+        br <- br[br >= limits[1] &
+                   br <= limits[2]]
       }
 
       return(br)
     }
 
-    trans <- scales::as.transform(self$transforms[[i]])
-    x_raw <- self$.trained_values_raw[[i]]
-    x_t <- self$.trained_values_transformed[[i]]
-
-    keep <- is.finite(x_raw) & is.finite(x_t)
-    x_raw <- x_raw[keep]
-    x_t <- x_t[keep]
-
-    if (!is.null(limits)) {
-      x_t <- x_t[x_raw >= limits[1] & x_raw <= limits[2]]
+    # User-supplied break function
+    if (is.function(br)) {
+      return(numeric_breaks(br(limits)))
     }
 
+    trans <- scales::as.transform(self$transforms[[i]])
+
+    limits <- sort(as.numeric(limits))
     limits_t <- sort(as.numeric(trans$transform(limits)))
 
-    if (!length(x_t)) {
-      br_t <- seq(limits_t[1], limits_t[2], length.out = self$n_breaks[i] + 1)
-      return(as.numeric(trans$inverse(br_t)))
-    }
+    n <- self$n_breaks[i]
 
-    if (identical(self$bin_method[[i]], "quantile")) {
-      br_t <- quantile(
-        x_t,
-        probs = seq(0, 1, length.out = self$n_breaks[i] + 1),
-        na.rm = TRUE,
-        names = FALSE
-      )
+    # Quantile bins
+    if (self$quantile[i]) {
+      x_raw <- self$.trained_values_raw[[i]]
+      x_t <- self$.trained_values_transformed[[i]]
 
-      if (length(unique(br_t)) < length(br_t)) {
-        br_t <- seq(limits_t[1], limits_t[2], length.out = self$n_breaks[i] + 1)
-      } else {
-        br_t[c(1, length(br_t))] <- limits_t
+      keep <- is.finite(x_raw) & is.finite(x_t)
+
+      x_raw <- x_raw[keep]
+      x_t <- x_t[keep]
+
+      keep <- x_raw >= limits[1] &
+        x_raw <= limits[2]
+
+      x_t <- x_t[keep]
+
+      if (length(x_t)) {
+        breaks_t <- quantile(
+          x_t,
+          probs = seq(0, 1, length.out = n + 1),
+          na.rm = TRUE,
+          names = FALSE
+        )
+
+        if (length(unique(breaks_t)) < n + 1) {
+          breaks_t <- seq(limits_t[1], limits_t[2], length.out = n + 1)
+        } else {
+          breaks_t[c(1, length(breaks_t))] <- limits_t
+        }
+
+        return(as.numeric(trans$inverse(breaks_t)))
       }
-    } else {
-      br_t <- seq(limits_t[1], limits_t[2], length.out = self$n_breaks[i] + 1)
     }
 
-    as.numeric(trans$inverse(br_t))
+    # Exact equal-width bins
+    if (!self$nice.breaks[i]) {
+      breaks_t <- seq(limits_t[1], limits_t[2], length.out = n + 1)
+
+      return(as.numeric(trans$inverse(breaks_t)))
+    }
+
+    # Pretty breaks
+    breaks_t <- scales::breaks_pretty(n = n)(limits_t)
+
+    if (!is.null(self$limits[[i]])) {
+      internal_t <- breaks_t[breaks_t > limits_t[1] &
+                               breaks_t < limits_t[2]]
+
+      breaks_t <- c(limits_t[1], internal_t, limits_t[2])
+    }
+
+    as.numeric(trans$inverse(breaks_t))
   },
 
   get_breaks = function(self, limits = self$get_limits()) {
@@ -127,21 +197,36 @@ ScaleBivariate <- ggproto(
   get_breaks_transformed = function(self, limits = self$get_limits()) {
     breaks <- self$get_breaks(limits)
 
-    list(
-      scales::as.transform(self$transforms[[1]])$transform(breaks[[1]]),
+    list(if (self$is_discrete_1d(1)) {
+      breaks[[1]]
+    } else {
+      scales::as.transform(self$transforms[[1]])$transform(breaks[[1]])
+    }, if (self$is_discrete_1d(2)) {
+      breaks[[2]]
+    } else {
       scales::as.transform(self$transforms[[2]])$transform(breaks[[2]])
-    )
+    })
   },
 
   get_labels_1d = function(self, i, breaks) {
     labels <- self$labels[[i]]
 
-    if (is.null(labels))
+    if (is.null(labels)) {
       return(NULL)
-    if (is_waiver(labels))
+    }
+
+    if (is_waiver(labels)) {
+      if (self$is_discrete_1d(i)) {
+        return(as.character(breaks))
+      }
+
       return(scales::label_number()(breaks))
-    if (is.function(labels))
+    }
+
+    if (is.function(labels)) {
       return(labels(breaks))
+    }
+
     labels
   },
 
@@ -150,9 +235,21 @@ ScaleBivariate <- ggproto(
          self$get_labels_1d(2, breaks[[2]]))
   },
 
+  get_n_breaks_1d = function(self, i, breaks) {
+    if (self$is_discrete_1d(i)) {
+      length(breaks)
+    } else {
+      length(breaks) - 1L
+    }
+  },
+
+  get_n_breaks = function(self, breaks = self$get_breaks()) {
+    c(self$get_n_breaks_1d(1, breaks[[1]]),
+      self$get_n_breaks_1d(2, breaks[[2]]))
+  },
+
   get_key_colours = function(self, breaks = self$get_breaks()) {
-    n_breaks <- c(length(breaks[[1]]) - 1L, length(breaks[[2]]) - 1L)
-    self$palette_fn(n_breaks)
+    self$palette_fn(self$get_n_breaks(breaks))
   },
 
   map = function(self, x, limits = self$get_limits()) {
@@ -160,50 +257,99 @@ ScaleBivariate <- ggproto(
       return(x)
     }
 
-    x1 <- vapply(x, `[[`, numeric(1), "v1")
-    x2 <- vapply(x, `[[`, numeric(1), "v2")
+    x1 <- do.call(c, lapply(x, `[[`, "v1"))
+    x2 <- do.call(c, lapply(x, `[[`, "v2"))
 
-    trans1 <- scales::as.transform(self$transforms[[1]])
-    trans2 <- scales::as.transform(self$transforms[[2]])
-
-    limits_t <- list(sort(as.numeric(trans1$transform(limits[[1]]))), sort(as.numeric(trans2$transform(limits[[2]]))))
-
+    breaks <- self$get_breaks(limits)
     breaks_t <- self$get_breaks_transformed(limits)
 
-    x_bin <- cut(x1, breaks_t[[1]], include.lowest = TRUE, labels = FALSE)
-    y_bin <- cut(x2, breaks_t[[2]], include.lowest = TRUE, labels = FALSE)
+    x_bin <- if (self$is_discrete_1d(1)) {
+      match(as.character(x1), as.character(breaks[[1]]))
+    } else {
+      cut(x1,
+          breaks_t[[1]],
+          include.lowest = TRUE,
+          labels = FALSE)
+    }
 
-    in_limits <-
-      is.finite(x1) & is.finite(x2) &
-      x1 >= limits_t[[1]][1] & x1 <= limits_t[[1]][2] &
-      x2 >= limits_t[[2]][1] & x2 <= limits_t[[2]][2]
+    y_bin <- if (self$is_discrete_1d(2)) {
+      match(as.character(x2), as.character(breaks[[2]]))
+    } else {
+      cut(x2,
+          breaks_t[[2]],
+          include.lowest = TRUE,
+          labels = FALSE)
+    }
 
-    nx <- length(breaks_t[[1]]) - 1L
+    in_x <- if (self$is_discrete_1d(1)) {
+      !is.na(x_bin)
+    } else {
+      limits_t <- sort(as.numeric(
+        scales::as.transform(self$transforms[[1]])$transform(limits[[1]])
+      ))
+
+      is.finite(x1) &
+        x1 >= limits_t[1] &
+        x1 <= limits_t[2]
+    }
+
+    in_y <- if (self$is_discrete_1d(2)) {
+      !is.na(y_bin)
+    } else {
+      limits_t <- sort(as.numeric(
+        scales::as.transform(self$transforms[[2]])$transform(limits[[2]])
+      ))
+
+      is.finite(x2) &
+        x2 >= limits_t[1] &
+        x2 <= limits_t[2]
+    }
+
+    in_limits <- in_x & in_y
+
+    n_breaks <- self$get_n_breaks(breaks)
+    nx <- n_breaks[1]
+
     id <- (y_bin - 1L) * nx + x_bin
     id[!in_limits] <- NA_integer_
 
-    colours <- self$get_key_colours(self$get_breaks(limits))
+    colours <- self$get_key_colours(breaks)
 
     out <- rep(self$na.value, length(id))
-    out[!is.na(id)] <- colours[id[!is.na(id)]]
+
+    out[!is.na(id)] <-
+      colours[id[!is.na(id)]]
+
     out
   },
 
   break_info = function(self, limits = self$get_limits()) {
     breaks <- self$get_breaks(limits)
     labels <- self$get_labels(breaks)
+    n_breaks <- self$get_n_breaks(breaks)
 
     list(
       title = self$name,
       limits = limits,
-      n_breaks = c(length(breaks[[1]]) - 1L, length(breaks[[2]]) - 1L),
+      n_breaks = n_breaks,
+
       x_breaks = breaks[[1]],
       y_breaks = breaks[[2]],
+
       x_labels = labels[[1]],
       y_labels = labels[[2]],
+
+      x_discrete = self$is_discrete_1d(1),
+      y_discrete = self$is_discrete_1d(2),
+
       key_colours = unname(as.character(self$get_key_colours(breaks))),
-      var1_title = self$var1_name %||% self$var_names[1],
-      var2_title = self$var2_name %||% self$var_names[2],
+
+      var1_title =
+        self$var1_name %||% self$var_names[1],
+
+      var2_title =
+        self$var2_name %||% self$var_names[2],
+
       aesthetics = self$aesthetics
     )
   },
@@ -212,11 +358,15 @@ ScaleBivariate <- ggproto(
     self$break_info()
   },
 
-  train = function(self, x)
-    invisible(),
-  train_df = function(self, df)
+  train = function(self, x) {
     invisible()
+  },
+
+  train_df = function(self, df) {
+    invisible()
+  }
 )
+
 
 #' Bivariate colour scale constructor
 #'
@@ -229,16 +379,20 @@ ScaleBivariate <- ggproto(
 #'
 #' @inheritParams ggplot2::discrete_scale
 #' @param breaks A list of two numeric vectors specifying bin boundaries for
-#'   each variable. If `waiver()`, breaks are computed from the data according
-#'   to `n_breaks` and `bin_method`.
-#' @param labels A list of two character vectors or labelling functions
-#'   used to label the bin boundaries for each variable. If `waiver()`,
-#'   default numeric labels are used.
-#' @param limits A list of two numeric vectors specifying the range of
-#'   values to include for each variable.
-#' @param transform A list of two transformations applied to the variables
-#'   before binning. Each element can be a transformation name or a
-#'   transformer object accepted by [scales::as.transform()].
+#'   the two variables. If `waiver()`, breaks are computed automatically
+#'   according to `n_breaks`, `nice.breaks`, and `quantile`.
+#' @param labels A list of two character vectors or labelling functions used
+#'   to label the bin boundaries for the two variables. If `waiver()`,
+#'   default labels are generated from the breaks.
+#' @param limits A list of two vectors specifying the limits for the two
+#'   variables. For continuous variables, each element specifies the numeric
+#'   range to include. For discrete variables, it specifies the levels to
+#'   include.
+#' @param transform A list of one or two transformations applied to continuous
+#'   variables before binning. Automatic pretty, equal-width, and quantile
+#'   breaks are computed on the transformed scale. Each element can be a
+#'   transformation name or a transformer object accepted by
+#'   [scales::as.transform()].
 #' @param colours A character vector of colours used as key points in the colour
 #'   ramp that variables are mapped to. For details on how supplied colours are
 #'   used to construct the resulting palette, see [bivar_palette()] and
@@ -246,13 +400,24 @@ ScaleBivariate <- ggproto(
 #' @param palette_fun A palette function that, when called with `colours` and
 #'   `n_breaks`, returns a character vector of colours for all binned
 #'   combinations. If `NULL`, the default, [bivar_palette()] is used.
-#' @param palette_params A list of additional arguments passed to `palette`. For
-#'   details of arguments, see [bivar_palette()] and [bivar_fade_palette()].
-#' @param n_breaks An integer or a length-two vector specifying the number of
-#'   bins for each variable. The default is 4 for both variables, and unequal
-#'   numbers of bins are supported.
-#' @param bin_method A character string or a length-two vector specifying the
-#'   method used to bin each variable: `"equal"` (the default) or `"quantile"`.
+#' @param palette_params A list of additional arguments passed to `palette_fun`.
+#'   See [bivar_palette()] and [bivar_fade_palette()] for available arguments.
+#' @param n_breaks An integer or a length-two vector specifying the desired
+#'   number of bins for each variable. The default is 4 for both variables.
+#'   When `nice.breaks = TRUE`, this value is treated as a suggestion and the
+#'   actual number of bins may differ. When `nice.breaks = FALSE`, exactly
+#'   `n_breaks` equal-width bins are generated. Unequal desired numbers of
+#'   bins are supported.
+#' @param nice.breaks A logical value or length-two logical vector indicating
+#'   whether automatically generated breaks should use pretty, human-readable
+#'   values. When `TRUE`, breaks are generated using [scales::breaks_pretty()] on the
+#'   transformed scale, with `n_breaks` treated as a suggestion. The resulting
+#'   breaks may extend beyond the data range and the actual number of bins may
+#'   differ from `n_breaks`. When `FALSE`, exactly `n_breaks` equal-width bins
+#'   are generated.
+#' @param quantile A logical value or length-two logical vector indicating
+#'   whether the variables should be divided using quantile-based bins.
+#'   If quantile breaks are not unique, equal-width bins are used instead.
 #' @param ... Other arguments passed to [ggplot2::discrete_scale()].
 #' @param var1_name,var2_name Optional names for `v1` and `v2`. Used as axis
 #'   titles in the legend. If `NULL`, the default, the names are taken from the
@@ -272,31 +437,40 @@ bivariate_scale <- function(aesthetics,
                             na.translate = TRUE,
                             drop = FALSE,
                             guide = waiver(),
-                            colours = c("gold", "red4"),
+                            colours = c("#EDF8B1", "#2C7FB8"),
                             palette_fun = NULL,
                             palette_params = list(),
                             n_breaks = c(4, 4),
-                            bin_method = c("equal", "equal"),
+                            nice.breaks = TRUE,
+                            quantile = FALSE,
                             var1_name = NULL,
                             var2_name = NULL,
                             super = ScaleBivariate) {
   normalize_pair <- function(x, name) {
-    if (length(x) == 1)
+    if (length(x) == 1) {
       x <- rep(x, 2)
+    }
+
     if (length(x) != 2) {
       cli::cli_abort("{.arg {name}} must have length 1 or 2.")
     }
+
     x
   }
 
   normalize_pair_list <- function(x, name) {
-    if (!is.list(x))
+    if (!is.list(x)) {
       x <- list(x)
-    if (length(x) == 1)
+    }
+
+    if (length(x) == 1) {
       x <- rep(x, 2)
+    }
+
     if (length(x) != 2) {
       cli::cli_abort("{.arg {name}} must have length 1 or 2.")
     }
+
     x
   }
 
@@ -318,18 +492,34 @@ bivariate_scale <- function(aesthetics,
   }
 
   n_breaks <- normalize_pair(n_breaks, "n_breaks")
-  bin_method <- normalize_pair(match.arg(bin_method, c("quantile", "equal"), several.ok = TRUE), "bin_method")
+
+  nice.breaks <- normalize_pair(nice.breaks, "nice.breaks")
+
+  quantile <- normalize_pair(quantile, "quantile")
+
   transform <- normalize_pair_list(transform, "transform")
+
   breaks <- normalize_pair_list(breaks, "breaks")
+
   labels <- normalize_pair_list(labels, "labels")
+
   limits <- normalize_pair_list(limits, "limits")
+
+  limits <- lapply(limits, function(x) {
+    if (is_waiver(x)) {
+      NULL
+    } else {
+      x
+    }
+  })
 
   invisible(lapply(transform, scales::as.transform))
 
   sc <- discrete_scale(
     aesthetics = aesthetics,
-    palette = function(n)
-      seq_len(n),
+    palette = function(n) {
+      seq_len(n)
+    },
     name = name,
     na.value = na.value,
     na.translate = na.translate,
@@ -344,10 +534,12 @@ bivariate_scale <- function(aesthetics,
   sc$limits <- limits
   sc$colours <- colours
   sc$n_breaks <- n_breaks
-  sc$bin_method <- bin_method
+  sc$nice.breaks <- nice.breaks
+  sc$quantile <- quantile
   sc$transforms <- transform
   sc$var1_name <- var1_name
   sc$var2_name <- var2_name
+
   sc$palette_fn <- resolve_palette(
     palette_fun = palette_fun,
     colours = colours,
@@ -356,6 +548,7 @@ bivariate_scale <- function(aesthetics,
 
   sc
 }
+
 
 #' @examples
 #' # Basic bivariate map
@@ -370,25 +563,34 @@ bivariate_scale <- function(aesthetics,
 #'     colours = c("#F6E8C3", "orange", "red")
 #'   )
 #'
-#' # Customize the number of bins
+#' # Customize the desired number of bins
 #' ggplot(nc) +
 #'   geom_sf(aes(fill = duo(value, sd))) +
 #'   scale_fill_bivariate(n_breaks = c(3, 4))
+#'
+#' # Use exactly four equal-width bins for each variable
+#' ggplot(nc) +
+#'   geom_sf(aes(fill = duo(value, sd))) +
+#'   scale_fill_bivariate(
+#'     n_breaks = 4,
+#'     nice.breaks = FALSE
+#'   )
 #' @rdname bivariate_scale
 #' @export
 scale_fill_bivariate <- function(...,
                                  name = waiver(),
                                  var1_name = NULL,
                                  var2_name = NULL,
-                                 colours = c("gold", "red4"),
+                                 colours = c("#EDF8B1", "#2C7FB8"),
                                  palette_fun = NULL,
                                  palette_params = list(),
                                  n_breaks = c(4, 4),
+                                 nice.breaks = TRUE,
+                                 quantile = FALSE,
                                  breaks = list(waiver(), waiver()),
                                  labels = list(waiver(), waiver()),
                                  limits = list(NULL, NULL),
                                  transform = list("identity", "identity"),
-                                 bin_method = c("equal", "equal"),
                                  na.value = NA,
                                  aesthetics = "fill",
                                  guide = guide_bivariate()) {
@@ -406,11 +608,13 @@ scale_fill_bivariate <- function(...,
     palette_fun = palette_fun,
     palette_params = palette_params,
     n_breaks = n_breaks,
-    bin_method = bin_method,
+    nice.breaks = nice.breaks,
+    quantile = quantile,
     var1_name = var1_name,
     var2_name = var2_name
   )
 }
+
 
 #' @rdname bivariate_scale
 #' @export
@@ -418,15 +622,16 @@ scale_color_bivariate <- function(...,
                                   name = waiver(),
                                   var1_name = NULL,
                                   var2_name = NULL,
-                                  colours = c("gold", "red4"),
+                                  colours = c("#EDF8B1", "#2C7FB8"),
                                   palette_fun = NULL,
                                   palette_params = list(),
                                   n_breaks = c(4, 4),
+                                  nice.breaks = TRUE,
+                                  quantile = FALSE,
                                   breaks = list(waiver(), waiver()),
                                   labels = list(waiver(), waiver()),
                                   limits = list(NULL, NULL),
                                   transform = list("identity", "identity"),
-                                  bin_method = c("equal", "equal"),
                                   na.value = NA,
                                   aesthetics = "colour",
                                   guide = guide_bivariate()) {
@@ -438,11 +643,12 @@ scale_color_bivariate <- function(...,
     palette_fun = palette_fun,
     palette_params = palette_params,
     n_breaks = n_breaks,
+    nice.breaks = nice.breaks,
+    quantile = quantile,
     breaks = breaks,
     labels = labels,
     limits = limits,
     transform = transform,
-    bin_method = bin_method,
     na.value = na.value,
     aesthetics = aesthetics,
     guide = guide,
@@ -450,9 +656,11 @@ scale_color_bivariate <- function(...,
   )
 }
 
+
 #' @rdname bivariate_scale
 #' @export
 scale_colour_bivariate <- scale_color_bivariate
+
 
 #' @export
 scale_type.bivariate <- function(x) "bivariate"

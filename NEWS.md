@@ -1,3 +1,9 @@
+# ggincerta 0.2.1
+
+* Added `nc_sim`, a simulated areal dataset with linear trend, hotspot, and CAR spatial patterns at two signal strengths.
+
+* `scale_bivariate()` now uses pretty breaks for automatic binning when `nice.breaks = TRUE`.
+
 # ggincerta 0.2.0
 
 ## New features
